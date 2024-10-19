@@ -1,0 +1,65 @@
+---
+title: "Feature Extraction"
+---
+
+## Libraries 
+```{r}
+```
+
+## Set Data File Path
+
+```{r}
+cur_dir <- dirname(getwd())
+
+processed_data_csv <- paste(cur_dir,
+                            "data/processed/processed_data.csv",
+                            sep = "/")
+
+
+dim_reduced_data_csv <- paste(cur_dir,
+                              "data/processed/dim_reduced_data.csv", sep = "/")
+```
+
+## Read In Data
+
+```{r}
+train_df <- read.csv(processed_data_csv)
+```
+
+## Perform PCA
+
+```{r}
+# Load data
+data <- train_df[, -1]
+
+# Check for constant columns
+constant_columns <- sapply(data, function(x) length(unique(x)) <= 1)
+data <- data[, !constant_columns]
+```
+
+```{r}
+pca_result <- prcomp(data, scale. = TRUE)
+
+transformed_data <- pca_result$x
+```
+
+```{r}
+# Summary of PCA
+summary(pca_result)
+
+# Scree Plot
+screeplot(pca_result, main = "Scree Plot", type = "lines")
+```
+
+## Lets say we like the top 34 principal components
+
+```{r}
+dim_reduced_data <- data.frame(transformed_data[, 1:34])
+dim_reduced_data$target <- train_df[, 1]
+```
+
+## Convert to dimensionally reduced csv
+
+```{r}
+write.csv(dim_reduced_data, dim_reduced_data_csv, row.names = FALSE)
+```

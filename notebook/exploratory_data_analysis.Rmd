@@ -1,0 +1,23 @@
+---
+title: "Exploratory Data Analysis"
+---
+
+## Libraries 
+```{r}
+```
+
+## Set Data File Path
+
+```{r}
+cur_dir <- getwd()
+
+eda_csv <- paste(cur_dir,
+                 "data/processed/EDA_data.csv",
+                 sep = "/")
+```
+
+## Read In Data
+
+```{r}
+df <- read.csv(eda_csv)
+```

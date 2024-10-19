@@ -1,0 +1,300 @@
+---
+title: "model"
+---
+
+## Libraries 
+```{r}
+library(lightgbm)
+library(data.table)
+library(pROC)
+library(reticulate)
+```
+
+```{r}
+remotes::install_github("rstudio/tensorflow", force=TRUE)
+remotes::install_github("rstudio/keras", force=TRUE)
+
+library(tensorflow)
+install_tensorflow(envname = "r-tensorflow")
+library(keras)
+install_keras(envname = "r-tensorflow")
+```
+
+```{r}
+# py_install("optuna")
+optuna <- import("optuna")
+np <- import("numpy")
+```
+
+
+## Set Data File Path
+
+```{r}
+setwd("..")
+cur_dir <- getwd()
+
+dim_reduced_data_csv <- paste(cur_dir,
+                              "data/processed/dim_reduced_data.csv", sep = "/")
+```
+
+## Global function definitions
+
+```{r}
+calc_pauc <- function(test_labels, predicted_classes) {
+  roc_obj <- roc(test_labels, predicted_classes, levels = c(0, 1))
+
+  pauc_value <- auc(roc_obj,
+                    partial.auc = c(0.8, 1),
+                    partial.auc.focus = "sensitivity"
+                    )
+  return(pauc_value)
+}
+```
+
+## Global variables
+
+```{r}
+epochs <- 50
+batch_size <- 32
+```
+
+## Read In Data
+
+```{r}
+df <- read.csv(dim_reduced_data_csv)
+```
+
+## Train Test Split
+
+```{r}
+set.seed(123)
+train_indices <- sample(1:nrow(df), 0.8 * nrow(df)) # nolint: seq_linter.
+train_data <- df[train_indices, ]
+test_data <- df[-train_indices, ]
+```
+
+## Setup data for LGBM
+
+```{r}
+dtrain <- lgb.Dataset(data = as.matrix(train_data[, -ncol(train_data)]),
+                      label = train_data$target)
+dtest <- as.matrix(test_data[, -ncol(train_data)])
+test_labels <- test_data$target
+```
+
+## Set up data for neural networks
+
+```{r}
+y_train <- np$array(as.numeric(train_data$target))
+x_train <- np$array(train_data[, -ncol(train_data)])
+
+y_test <- test_data$target
+x_test <- np$array(test_data[, -ncol(test_data)])
+
+num_features <- ncol(train_data) - 1
+```
+
+## Set up early stopping criteria
+
+```{r}
+early_stopping <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 5,
+  restore_best_weights = TRUE)
+```
+
+
+# Bayesian Hyper-Parameter Tuning
+
+## Light GBM hyper parameter search
+
+```{r}
+objective <- function(trial) {
+  params <- list(
+    metric = "logloss",
+    boosting_type = "gbdt",
+    learning_rate = trial$suggest_float("learning_rate", .005, .1, log = TRUE),
+    num_leaves = trial$suggest_int("num_leaves", 15, 80),
+    max_depth = -1,
+    n_estimators = trial$suggest_int("n_estimators", 100, 250),
+    force_col_wise=TRUE # Remove overhead for training of lightgbm model
+  )
+
+  model <- lgb.train(params, dtrain, nrounds = 100)
+
+  predicted_classes <- predict(model, dtest)
+
+  score <- calc_pauc(test_labels, predicted_classes)
+
+  return(score)
+}
+
+# Create the study
+study <- optuna$create_study(direction = "maximize")
+study$optimize(objective, n_trials = 100L)
+
+# Get the best parameters
+lgb_best_params <- study$best_params
+print(lgb_best_params)
+```
+
+## MLP hyperparameter search
+
+```{r}
+create_model <- function(trial) {
+  n_layers <- trial$suggest_int("n_layers", 1L, 5L)
+
+  model <- keras_model_sequential()
+
+  for (i in 1:n_layers) {
+    units <- trial$suggest_int(paste0("n_units_l", i), 32L, 128L)
+    activation <- trial$suggest_categorical(paste0("activation_l", i), 
+                                            list("relu", "tanh"))
+
+    if (i == 1) {
+      model %>% layer_dense(units = units, activation = activation, 
+                            input_shape = c(ncol(x_train)))
+    } else {
+      model %>% layer_dense(units = units, activation = activation)
+    }
+  }
+
+  # Output layer
+  model %>% layer_dense(units = 1)
+
+  # Compile the model
+  learning_rate <- trial$suggest_loguniform("learning_rate", 5e-5, 5e-2)
+
+  # Use the legacy Adam optimizer
+  optimizer <- tf$keras$optimizers$legacy$Adam(learning_rate = learning_rate)
+
+  model %>% compile(
+    optimizer = optimizer,
+    loss = "mean_squared_error"
+  )
+
+  return(model)
+}
+
+y_train <- train_data$target
+x_train <- train_data[, -ncol(train_data)]
+
+y_test <- test_data$target
+x_test <- test_data[, -ncol(test_data)]
+
+objective <- function(trial) {
+
+  score <- 0
+  for (i in 1:5) {
+    model <- create_model(trial)
+    
+    n_train_samples <- floor(0.2 * nrow(x_train))
+    n_test_samples <- floor(0.2 * nrow(x_test))
+    
+    train_indices <- sample(1:nrow(x_train), n_train_samples)
+    test_indices <- sample(1:nrow(x_test), n_test_samples)
+    
+    # Subset the data
+    x_train_sampled <- np$array(x_train[train_indices, ])
+    y_train_sampled <- np$array(as.numeric((y_train[train_indices])))
+    
+    x_test_sampled <- np$array(x_test[test_indices, ])
+    y_test_sampled <- y_test[test_indices]
+    
+    model$fit(
+    x_train_sampled, y_train_sampled,
+    validation_split = 0.2,
+    callbacks = list(early_stopping)  
+    )
+  
+    predicted_classes <- predict(model, as.matrix(x_test_sampled))
+    
+    score <- score + calc_pauc(y_test_sampled, predicted_classes)
+  }
+  
+  return(score / 5)
+}
+
+# Create the study
+study <- optuna$create_study(direction = "maximize")
+study$optimize(objective, n_trials = 100L)
+
+# Get the best parameters
+mlp_best_params <- study$best_params
+print(mlp_best_params)
+```
+
+## ResNet hyperparameter search
+
+```{r}
+create_model <- function(trial) {
+  n_layers <- trial$suggest_int("n_layers", 2L, 3L)
+
+  model <- keras_model_sequential()
+
+  for (i in 1:n_layers) {
+    units <- trial$suggest_int(paste0("n_units_l", i), 32L, 128L)
+    activation <- trial$suggest_categorical(paste0("activation_l", i), 
+                                            list("relu", "tanh"))
+
+    if (i == 1) {
+      model %>% layer_dense(units = units, activation = activation, 
+                            input_shape = c(ncol(x_train)))
+    } else {
+      model %>% layer_dense(units = units, activation = activation)
+    }
+
+    dropout_rate <- trial$suggest_loguniform(paste0("dropout_l", i), 5e-4, 5e-2)
+    model %>% layer_dropout(rate = dropout_rate)
+  }
+
+  # Output layer
+  model %>% layer_dense(units = 1)
+
+  # Compile the model
+  learning_rate <- trial$suggest_loguniform("learning_rate", 5e-4, 5e-1)
+
+  # Use the legacy Adam optimizer
+  optimizer <- tf$keras$optimizers$legacy$Adam(learning_rate = learning_rate)
+
+  model %>% compile(
+    optimizer = optimizer,
+    loss = "mean_squared_error"
+  )
+
+  return(model)
+}
+
+objective <- function(trial) {
+
+  model <- create_model(trial)
+  
+  model$fit(
+  x_train, y_train,
+  validation_split = 0.2,
+  callbacks = list(early_stopping)  
+  )
+
+  predicted_classes <- predict(model, x_test)
+  score <- calc_pauc(test_labels, predicted_classes)
+
+  return(score)
+}
+
+# Create the study
+study <- optuna$create_study(direction = "maximize")
+study$optimize(objective, n_trials = 100L)
+
+# Get the best parameters
+resnet_best_params <- study$best_params
+print(resnet_best_params)
+```
+
+
+## Save best parameters
+
+```{r}
+saveRDS(lgb_best_params, file = "../data/processed/lgb_best_params.rds")
+saveRDS(mlp_best_params, file = "../data/processed/mlp_best_params.rds")
+saveRDS(resnet_best_params, file = "../data/processed/resnet_best_params.rds")
+```

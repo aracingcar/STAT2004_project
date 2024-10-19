@@ -1,0 +1,407 @@
+---
+title: "model"
+---
+
+## Libraries 
+```{r}
+library(lightgbm)
+library(data.table)
+library(pROC)
+library(reticulate)
+```
+
+```{r}
+remotes::install_github("rstudio/tensorflow", force=TRUE)
+remotes::install_github("rstudio/keras", force=TRUE)
+
+library(tensorflow)
+install_tensorflow(envname = "r-tensorflow")
+library(keras)
+install_keras(envname = "r-tensorflow")
+```
+
+```{r}
+# py_install("optuna")
+optuna <- import("optuna")
+np <- import("numpy")
+```
+
+
+## Set Data File Path
+
+```{r}
+setwd("..")
+cur_dir <- getwd()
+
+dim_reduced_data_csv <- paste(cur_dir,
+                              "data/processed/dim_reduced_data.csv", sep = "/")
+```
+
+## Global function definitions
+
+```{r}
+calc_pauc <- function(test_labels, predicted_classes) {
+  roc_obj <- roc(test_labels, predicted_classes, levels = c(0, 1))
+
+  pauc_value <- auc(roc_obj,
+                    partial.auc = c(0.8, 1),
+                    partial.auc.focus = "sensitivity"
+                    )
+  return(pauc_value)
+}
+```
+
+## Global variables
+
+```{r}
+epochs <- 50
+batch_size <- 32
+```
+
+## Read In Data
+
+```{r}
+df <- read.csv(dim_reduced_data_csv)
+lgb_best_params <- readRDS("../data/processed/lgb_best_params.rds")
+mlp_best_params <- readRDS("../data/processed/mlp_best_params.rds")
+resnet_best_params <- readRDS("../data/processed/resnet_best_params.rds")
+```
+
+## Train Test Split
+
+```{r}
+set.seed(123)
+train_indices <- sample(1:nrow(df), 0.8 * nrow(df)) # nolint: seq_linter.
+train_data <- df[train_indices, ]
+test_data <- df[-train_indices, ]
+```
+
+## Setup data for LGBM
+
+```{r}
+dtrain <- lgb.Dataset(data = as.matrix(train_data[, -ncol(train_data)]),
+                      label = train_data$target)
+dtest <- as.matrix(test_data[, -ncol(train_data)])
+test_labels <- test_data$target
+```
+
+## Set up data for neural networks
+
+```{r}
+y_train <- np$array(as.numeric(train_data$target))
+x_train <- np$array(train_data[, -ncol(train_data)])
+
+y_test <- test_data$target
+x_test <- np$array(test_data[, -ncol(test_data)])
+
+num_features <- ncol(train_data) - 1
+```
+
+## Set up early stopping criteria
+
+```{r}
+early_stopping <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 5,
+  restore_best_weights = TRUE)
+```
+
+# Use optimised models for prediction and analysis
+
+## Light GBM Model
+
+```{r}
+# Set parameters
+params <- list(
+  metric = "logloss",
+  boosting_type = "gbdt",
+  learning_rate = lgb_best_params$learning_rate,
+  num_leaves = lgb_best_params$num_leaves,
+  max_depth = -1,
+  n_estimators = lgb_best_params$n_estimators
+)
+
+# Train the model
+lgb_model <- lgb.train(params, dtrain, nrounds = 100)
+
+# Make predictions
+lgb_preds <- predict(lgb_model, dtest)
+```
+
+## Linear Regression
+
+```{r}
+# Create a sequential model
+linear_model <- tf$keras$Sequential()
+linear_model %>% layer_dense(units = 1, 
+  input_shape = c(ncol(x_train))
+)
+
+# Compile the model
+linear_model$compile(
+  optimizer = optimizer_adam(),
+  loss = "binary_crossentropy"
+)
+
+linear_history <- linear_model$fit(
+  x_train, y_train,
+  epochs = as.integer(epochs),
+  validation_split = 0.2,
+  callbacks = list(early_stopping)
+  )
+
+linear_preds <- linear_model %>% predict(x_test)
+
+# Plot training history
+plot(linear_history$epoch, linear_history$history$loss,
+     type = "b",
+     col = "blue",
+     xlab = "Epoch", 
+     ylab = "Loss",
+     main = "Training Loss Over Epochs")
+
+lines(linear_history$epoch, linear_history$history$val_loss, type = "b",
+  col = "red")
+
+legend("topright", 
+       legend = c("Training Loss", "Validation Loss"),
+       col = c("blue", "red"),
+       lty = 1)
+
+grid()
+```
+
+## Logistic Model
+
+```{r}
+# Create a sequential model
+log_model <- tf$keras$Sequential()
+log_model %>% layer_dense(units = 1, 
+  input_shape = c(ncol(x_train)),
+  activation = "sigmoid"
+)
+
+# Compile the model
+log_model$compile(
+  optimizer = optimizer_adam(),
+  loss = 'binary_crossentropy'
+)
+
+log_history <- log_model$fit(
+  x_train, y_train,
+  epochs = as.integer(epochs),
+  validation_split = 0.2,
+  callbacks = list(early_stopping)
+  )
+
+log_preds <- log_model %>% predict(x_test)
+
+# Plot training history
+plot(log_history$epoch, log_history$history$loss,
+     type = "b",
+     col = "blue",
+     xlab = "Epoch", 
+     ylab = "Loss",
+     main = "Training Loss Over Epochs")
+
+lines(log_history$epoch, log_history$history$val_loss, type = "b",
+  col = "red")
+
+legend("topright", 
+       legend = c("Training Loss", "Validation Loss"),
+       col = c("blue", "red"),
+       lty = 1)
+
+grid()
+```
+
+## MLP Model
+
+```{r}
+learning_rate <- mlp_best_params$learning_rate
+
+n_layers <- mlp_best_params$n_layers
+n_units_l1 <- mlp_best_params$n_units_l1
+activation_l1 <- mlp_best_params$activation_l1
+n_units_l2 <- mlp_best_params$n_units_l2
+activation_l2 <- mlp_best_params$activation_l2
+n_units_l3 <- mlp_best_params$n_units_l3
+activation_l3 <- mlp_best_params$activation_l3
+n_units_l4 <- mlp_best_params$n_units_l4
+activation_l4 <- mlp_best_params$activation_l4
+
+create_resnet_model <- function() {
+  model <- keras_model_sequential()
+
+  model %>% layer_dense(units = n_units_l1, activation = activation_l1, 
+                            input_shape = c(ncol(x_train)))
+  model %>% layer_dense(units = n_units_l2, activation = activation_l2)
+  model %>% layer_dense(units = n_units_l3, activation = activation_l3)
+  model %>% layer_dense(units = n_units_l4, activation = activation_l4)
+  
+  model %>% layer_dense(units = 1)
+
+  optimizer <- tf$keras$optimizers$legacy$Adam(learning_rate = learning_rate)
+  
+  model %>% compile(
+    optimizer = optimizer,
+    loss = "mean_squared_error"
+  )
+
+  return(model)
+}
+
+mlp_model = create_resnet_model()
+
+mlp_history <- mlp_model$fit(
+  x_train, y_train,
+  epochs = as.integer(epochs),
+  validation_split = 0.2,
+  callbacks = list(early_stopping)
+  )
+
+mlp_preds <- mlp_model %>% predict(x_test)
+
+# Plot training history
+plot(mlp_history$epoch, mlp_history$history$loss,
+     type = "b",
+     col = "blue",
+     xlab = "Epoch", 
+     ylab = "Loss",
+     main = "Training Loss Over Epochs")
+
+lines(mlp_history$epoch, mlp_history$history$val_loss, type = "b",
+  col = "red")
+
+legend("topright", 
+       legend = c("Training Loss", "Validation Loss"),
+       col = c("blue", "red"),
+       lty = 1)
+
+grid()
+```
+
+## ResNet Model
+
+```{r}
+learning_rate <- resnet_best_params$learning_rate
+n_layers <- resnet_best_params$n_layers
+
+n_units_l1 <- resnet_best_params$n_units_l1
+activation_l1 <- resnet_best_params$activation_l1
+dropout_l1 <- resnet_best_params$dropout_l1
+n_units_l2 <- resnet_best_params$n_units_l2
+activation_l2 <- resnet_best_params$activation_l2
+dropout_l2 <- resnet_best_params$dropout_l2
+
+create_resnet_model <- function() {
+  model <- keras_model_sequential()
+
+  model %>% layer_dense(units = n_units_l1, activation = activation_l1, 
+                            input_shape = c(ncol(x_train)))
+  model %>% layer_dropout(rate = dropout_l1)
+  model %>% layer_dense(units = n_units_l2, activation = activation_l2)
+  model %>% layer_dropout(rate = dropout_l2)
+
+  model %>% layer_dense(units = 1)
+
+  optimizer <- tf$keras$optimizers$legacy$Adam(learning_rate = learning_rate)
+
+  model %>% compile(
+    optimizer = optimizer,
+    loss = "mean_squared_error"
+  )
+
+  return(model)
+}
+
+resnet_model = create_resnet_model()
+
+resnet_history <- resnet_model$fit(
+  x_train, y_train,
+  epochs = as.integer(epochs),
+  validation_split = 0.2,
+  callbacks = list(early_stopping)
+  )
+
+resnet_preds <- resnet_model %>% predict(x_test)
+
+# Plot training history
+plot(resnet_history$epoch, resnet_history$history$loss,
+     type = "b",
+     col = "blue",
+     xlab = "Epoch", 
+     ylab = "Loss",
+     main = "Training Loss Over Epochs")
+
+lines(resnet_history$epoch, resnet_history$history$val_loss, type = "b",
+  col = "red")
+
+legend("topright", 
+       legend = c("Training Loss", "Validation Loss"),
+       col = c("blue", "red"),
+       lty = 1)
+
+grid()
+```
+
+## pAUC
+
+```{r}
+library(ggplot2)
+library(gridExtra)
+
+labels <- c("LightGBM", "Logistic", "MLP", "ResNet")
+
+roc_lgb <- roc(test_labels, lgb_preds)
+roc_mlp <- roc(test_labels, log_preds)
+roc_resnet <- roc(test_labels, mlp_preds)
+roc_ensemble <- roc(test_labels, resnet_preds)
+
+roc_objects <- list(roc_lgb, roc_mlp, roc_resnet, roc_ensemble)
+
+plot_data <- data.frame()
+pauc_values <- c()
+
+for (i in 1:length(roc_objects)) {
+  roc_obj <- roc_objects[[i]]
+  label <- labels[i]
+  
+  # Calculate partial AUC
+  pauc_value <- auc(roc_obj, partial.auc = c(0.8, 1), partial.auc.focus = "sensitivity")
+  pauc_values <- c(pauc_values, pauc_value)
+  
+  # Extract coordinates for partial ROC curve
+  partial_coords <- coords(roc_obj, x = "all", ret = c("specificity", "sensitivity"))
+  data <- data.frame(
+    specificity = partial_coords$specificity,
+    sensitivity = partial_coords$sensitivity,
+    model = label
+  )
+  plot_data <- rbind(plot_data, data)
+}
+
+create_combined_roc_plot <- function(roc_objects, labels) {
+  
+  # Create the plot
+  ggplot(plot_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
+    geom_line() +
+    labs(title = "ROC Curves Comparison",
+         subtitle = sprintf("pAUC (0.8-1.0): LGB: %.3f, MLP: %.3f, ResNet: %.3f, Ensemble: %.3f", 
+                            pauc_values[1], pauc_values[2], pauc_values[3], pauc_values[4]),
+         x = "False Positive Rate", 
+         y = "True Positive Rate") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5, size = 8),
+          legend.position = "bottom",
+          legend.title = element_blank()) +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0.8, 1))
+}
+
+# Create the combined plot
+combined_plot <- create_combined_roc_plot(roc_objects, labels)
+
+# Display the plot
+print(combined_plot)
+```

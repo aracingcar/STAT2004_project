@@ -1,0 +1,264 @@
+
+```{r}
+library(dplyr)
+library(PerformanceAnalytics)
+library(ggplot2)
+library(reshape2)
+library(stats)
+library(caret)
+library(car)
+library(factoextra)
+library(psych)
+```
+
+## Read In Data
+
+```{r}
+train_df_all = read.csv("train-metadata.csv")
+```
+
+## Clean Data
+
+```{r}
+cols_to_remove = c("isic_id", "patient_id", "image_type", "iddx_full", "iddx_1", "iddx_2", "iddx_3", "iddx_4", "iddx_5", "lesion_id", "mel_mitotic_index", "copyright_license", "mel_thick_mm", "attribution", "tbp_lv_dnn_lesion_confidence")
+train_df = train_df_all %>% select(-all_of(cols_to_remove))
+```
+
+## Remove NA's
+
+```{r}
+columns_to_encode <- c("sex","anatom_site_general","tbp_tile_type","tbp_lv_location","tbp_lv_location_simple")
+
+for (column_to_encode in columns_to_encode) {
+  train_df = subset(train_df, train_df[[column_to_encode]] != "")
+}
+
+train_df = na.omit(train_df)
+train_df_exploratory <- train_df # data to be used in exploratory analysis
+```
+
+## One-hot Encoding
+
+```{r}
+# One-hot encoding using model.matrix
+for (column_to_encode in columns_to_encode) {
+  one_hot <- model.matrix(~ get(column_to_encode) - 1, data = train_df)
+  colnames(one_hot) <- gsub("get\\(column_to_encode\\)", column_to_encode, colnames(one_hot))
+  train_df <- cbind(train_df[ , !names(train_df) %in% column_to_encode], one_hot)
+}
+```
+
+## Down-Sample Data
+
+```{r}
+# percentage of target needed
+percentage = 0.03
+
+df = data.frame(train_df)
+
+total_rows <- nrow(df)
+
+target_rows = nrow(df[df$target==1,])
+
+# Calculate target class size needed
+total_rows_needed <- round(target_rows / percentage)
+
+# Filter the target class
+target_data <- df[df$target == 1, ]
+
+# Calculate how many non-target rows to keep
+non_target_rows_needed <- total_rows_needed - target_rows
+
+# Filter and downsample the non-target class
+non_target_data <- df[df$target == 0, ]
+sampled_non_target <- non_target_data[sample(nrow(non_target_data), non_target_rows_needed), ]
+
+# Combine the results
+df_reduced <- rbind(target_data, sampled_non_target)
+```
+
+# Multivariate Statistical Techniques
+
+```{r}
+# Load data
+data_test <- df_reduced[, -1]
+
+# Check for constant columns
+constant_columns <- sapply(data_test, function(x) length(unique(x)) <= 1)
+data_test <- data_test[, !constant_columns]
+
+# Scaled data (all variables)
+scaled_data_test <- scale(data_test)
+
+# Subset data 
+subset_data_test <- data_test[, c("clin_size_long_diam_mm", "tbp_lv_areaMM2", "tbp_lv_minorAxisMM", "tbp_lv_perimeterMM", "tbp_lv_area_perim_ratio", "tbp_lv_norm_border", "tbp_lv_symm_2axis", "tbp_lv_symm_2axis_angle", "tbp_lv_H", "tbp_lv_Hext", "tbp_lv_color_std_mean", "tbp_lv_deltaLBnorm", "tbp_lv_norm_color", "tbp_lv_radial_color_std_max")]
+
+# Scaled subset data 
+scaled_subset <- scale(subset_data_test)
+```
+
+
+# PCA - All Variables
+```{r}
+# Pca
+pca_result <- prcomp(data_test, scale. = TRUE)
+transformed_data <- pca_result$x
+
+# Summary of PCA
+summary(pca_result)
+```
+
+
+```{r}
+# Scree Plot - All Variables
+variances <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+scree_data <- data.frame(Component = 1:length(variances), Variance = variances)
+
+ggplot(scree_data, aes(x = Component, y = Variance)) +
+  geom_bar(stat = "identity") +
+  geom_line() +
+  scale_x_continuous(breaks = seq(0, max(scree_data$Component), by = 5)) +
+  ggtitle("Scree Plot - All Variables") +
+  xlab("Principal Component") +
+  ylab("Variance Explained")
+```
+
+From the Scree plot we can see there is an elbow at 14 principal components which accounts for 71.374% of cumulative variance. However there also seems to be a second smaller elbow at 34 principal components which accounts for 98.019% of cumulative variance. As we want to ensure our model is capturing enough variance we will use 34 principal components.
+
+```{r}
+n_components <- 34
+pca_score <- pca_result$x[, 1:n_components]
+pca_score_loadings <- pca_result$rotation[, 1:n_components]
+print(pca_score_loadings)
+```
+
+```{r}
+# Loading of PC1 and PC2 plot 
+loadings_data <- as.data.frame(pca_result$rotation[, 1:2])
+ggplot(loadings_data, aes(x = PC1, y = PC2)) +
+  geom_point() +
+  geom_text(aes(label = rownames(loadings_data)), vjust = -1) +
+  ggtitle("Loadings Plot") +
+  xlab("PC1") +
+  ylab("PC2")
+```
+For the first two PC's, the loading's are quite dispersed however there seems to be some grouping of the colour of lesion variables both being around -0.2 for PC1 and -0.1 for PC2. For PC1, shape of the lesion seems to bee +0.2.
+
+# PCA - Subset
+
+```{r}
+# PCA - Subset
+pca_result_subset <- prcomp(subset_data_test, scale. = TRUE)
+summary(pca_result_subset)
+```
+
+```{r}
+# Scree plot
+variances <- pca_result_subset$sdev^2 / sum(pca_result_subset$sdev^2)
+scree_data2 <- data.frame(Component = 1:length(variances), Variance = variances)
+
+ggplot(scree_data2, aes(x = Component, y = Variance)) +
+  geom_bar(stat = "identity") +
+  geom_line() +
+  scale_x_continuous(breaks = seq(0, max(scree_data2$Component), by = 1)) +
+  ggtitle("Scree Plot - Subset") +
+  xlab("Principal Component") +
+  ylab("Variance Explained")
+```
+Clear elbow at 4 PC's accounting for 85.14% of cumulative variance.
+
+```{r}
+# PCA loadings
+pca_result_subset$rotation
+```
+
+Interpreted as:
+- PC1: size and colour of lesion
+- PC2: jaggedness of lesion (tbp_lv_norm_border, tbp_lv_norm_border)
+- PC3: colour of lesion (tbp_lv_H, tbp_lv_Hext)
+- PC4: size of lesion (clin_size_long_diam_mm, tbp_lv_areaMM2, tbp_lv_minorAxisMM, tbp_lv_perimeterMM)
+
+
+# Clustering - All Variables
+
+```{r}
+err <- NULL
+for(i in 1:10){
+  k <- kmeans(x = scaled_data_test, centers=i, iter.max=50, nstart=25)
+  err <- c(err, k$tot.withinss)
+}
+plot(y=err, x=1:10, type="b", xlab = "Number of Clusters (k)", 
+     ylab = "Within-Cluster Sum of Squares (WSS)", main = "Elbow Method - All Variables")
+```
+Using the elbow method, there doesn't seem to be a very clear elbow, potentially 2, 4 or 8 clusters.
+
+```{r}
+# 5 clusters
+k <- kmeans(x = scaled_data_test, centers=4, iter.max=10, nstart=25)
+fviz_cluster(k, scaled_data_test) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - All Variables")
+```
+
+```{r}
+# 8 Clusters
+k <- kmeans(x = scaled_data_test, centers=8, iter.max=10, nstart=25)
+fviz_cluster(k, scaled_data_test) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - All Variables")
+```
+
+```{r}
+# 3 Clusters
+k <- kmeans(x = scaled_data_test, centers=3, iter.max=50, nstart=25)
+fviz_cluster(k, scaled_data_test) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - All Variables")
+```
+
+```{r}
+# 2 Clusters
+k <- kmeans(x = scaled_data_test, centers=2, iter.max=50, nstart=25)
+fviz_cluster(k, scaled_data_test) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - All Variables")
+```
+
+# Clustering - Subset
+
+```{r}
+# Elbow method
+err <- NULL
+for(i in 1:10){
+  k <- kmeans(x = scaled_subset, centers=i, iter.max=50, nstart=25)
+  err <- c(err, k$tot.withinss)
+}
+plot(y=err, x=1:10, type="b", xlab = "Number of Clusters (k)", 
+     ylab = "Within-Cluster Sum of Squares (WSS)", main = "Elbow Method - Subset")
+```
+From the above elbow method we can conclude that either 3 or 4 clusters is optimal.
+
+```{r}
+# 2 Clusters on Subset Data
+k <- kmeans(x = scaled_subset, centers=2, iter.max=50, nstart=25)
+fviz_cluster(k, scaled_subset) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - Subset")
+```
+
+```{r}
+# 3 Clusters
+k <- kmeans(x = scaled_subset, centers=3, iter.max=50, nstart=25)
+fviz_cluster(k, scaled_subset) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - Subset")
+```
+
+```{r}
+# 4 Clusters
+k <- kmeans(x = scaled_subset, centers=4, iter.max=50, nstart=25)
+fviz_cluster(k, scaled_subset) + geom_vline(xintercept=0) + geom_hline(yintercept=0) + ggtitle("Cluster Plot - Subset")
+```
+
+# Factor Analysis
+
+```{r}
+fa.parallel(subset_data_test, fa = "fa", ylab = "Eigen Value")
+```
+
+```{r}
+factanal(factors = 5, covmat = cov(subset_data_test), rotation = "varimax")
+```
+
+After fitting the 5 factors, 84.4% of variance was accounted for. Factor 1 captured the size of lesion, factor 2 captured the colour of the lesion, factor 3 captured the jaggedness of the lesion, factor 4 captured the colour (specifically the hue), factor 5 captured the jaggeness and size of the lesion.
+
+
+

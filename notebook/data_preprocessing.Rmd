@@ -1,0 +1,117 @@
+---
+title: "Data Preprocessing"
+---
+
+## Libraries 
+```{r}
+library(dplyr)
+```
+
+## Set Data File Path
+
+```{r}
+cur_dir <- dirname(getwd())
+
+train_metadata_csv <- paste(cur_dir,
+                            "data/raw/train-metadata.csv",
+                            sep = "/")
+
+eda_csv <- paste(cur_dir,
+                 "data/processed/EDA_data.csv",
+                 sep = "/")
+
+processed_data_csv <- paste(cur_dir,
+                            "data/processed/processed_data.csv",
+                            sep = "/")
+```
+
+## Read In Data
+
+```{r}
+train_df_all <- read.csv(train_metadata_csv)
+```
+
+## Clean Data
+
+```{r}
+cols_to_remove <- c("isic_id", "patient_id", "image_type",
+                    "iddx_full", "iddx_1", "iddx_2", "iddx_3",
+                    "iddx_4", "iddx_5", "lesion_id", "mel_mitotic_index",
+                    "copyright_license", "mel_thick_mm", "attribution",
+                    "tbp_lv_dnn_lesion_confidence")
+train_df <- train_df_all %>% select(-all_of(cols_to_remove))
+```
+
+## Remove NA's
+
+```{r}
+columns_to_encode <- c("sex", "anatom_site_general", "tbp_tile_type",
+                       "tbp_lv_location", "tbp_lv_location_simple")
+
+for (column_to_encode in columns_to_encode) {
+  train_df <- subset(train_df, train_df[[column_to_encode]] != "")
+}
+
+train_df <- na.omit(train_df)
+```
+
+## Convert to Exploratory Data Analysis csv
+
+```{r}
+write.csv(train_df, eda_csv, row.names = FALSE)
+```
+
+## One-hot Encoding
+
+```{r}
+encoded_df <- data.frame(train_df)
+
+# One-hot encoding using model.matrix
+for (column_to_encode in columns_to_encode) {
+  one_hot <- model.matrix(~ get(column_to_encode) - 1, data = encoded_df)
+  colnames(one_hot) <- gsub("get\\(column_to_encode\\)",
+                            column_to_encode, colnames(one_hot))
+
+  encoded_df <- cbind(encoded_df[, !names(encoded_df) %in% column_to_encode],
+                      one_hot)
+}
+```
+
+## Down-Sample Data
+
+```{r}
+# percentage of target needed
+percentage <- 0.03
+
+df <- data.frame(encoded_df)
+
+total_rows <- nrow(df)
+
+target_rows <- nrow(df[df$target == 1, ])
+
+# Calculate target class size needed
+total_rows_needed <- round(target_rows / percentage)
+
+# Filter the target class
+target_data <- df[df$target == 1, ]
+
+# Calculate how many non-target rows to keep
+non_target_rows_needed <- total_rows_needed - target_rows
+
+# Filter and downsample the non-target class
+non_target_data <- df[df$target == 0, ]
+sample_idx <- sample(nrow(non_target_data), non_target_rows_needed)
+sampled_non_target <- non_target_data[sample_idx, ]
+
+# Combine the results
+df_reduced <- rbind(target_data, sampled_non_target)
+```
+
+## Convert to processed csv
+
+```{r}
+write.csv(df_reduced, processed_data_csv, row.names = FALSE)
+```
+
+
+
